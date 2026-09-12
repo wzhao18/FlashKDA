@@ -239,12 +239,14 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     __syncthreads();
 
     int compute_tid = threadIdx.x;
+    int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
     int beta_smem_offset = (head_idx * T_total + int(bos) + local_t * CHUNK) & 7;
     if (compute_tid < CHUNK) {
-        shared_storage.beta_act.begin()[compute_tid] = sigmoid_tanh_approx_f32(
-            float(shared_storage.beta.begin()[beta_smem_offset + compute_tid]));
+        shared_storage.beta_act.begin()[compute_tid] = compute_tid < actual_len
+            ? sigmoid_tanh_approx_f32(
+                  float(shared_storage.beta.begin()[beta_smem_offset + compute_tid]))
+            : 0.0f;
     }
-    int actual_len = min(CHUNK, seq_len - local_t * CHUNK);
 
     // --- QK L2 Normalization ---
     {
@@ -435,7 +437,9 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     float g = reg_g[pass][tile_idx][v];
-                    BF16 q = BF16(bf16_to_f32(reg_q[pass][tile_idx][v]) * q_inv);
+                    BF16 q = row < actual_len
+                        ? BF16(bf16_to_f32(reg_q[pass][tile_idx][v]) * q_inv)
+                        : BF16(0);
                     BF16 k = row < actual_len ? BF16(bf16_to_f32(reg_k[pass][tile_idx][v]) * k_inv_scale) : BF16(0);
                     BF16 exp_cumsum = BF16(ex2_approx_ftz_f32(g));
                     r_qd(0, v) = q * exp_cumsum * BF16(scale);

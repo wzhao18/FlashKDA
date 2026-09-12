@@ -471,6 +471,7 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             load_pipeline.consumer_wait(load_read);
             int load_stage = load_read.index();
             int out_stage = out_write.index();
+            const int actual_len = min(CHUNK, seq_len - t * CHUNK);
 
             Tensor v_tile = make_tensor(make_smem_ptr(shared_storage.input[load_stage].v.begin()), VOLayout{});
             Tensor beta_tile = make_tensor(make_smem_ptr(shared_storage.input[load_stage].beta.begin()), BetaSmemLayout{});
@@ -605,8 +606,16 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(INV), tCrAi_k_view);
             cute::transform(tCrAi_k, tCrA_k, cute::identity{});
 
-            BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
-            BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
+            const bool row0_valid = group_id < actual_len;
+            const bool row1_valid = group_id + 8 < actual_len;
+            BF16 beta0 = row0_valid
+                ? BF16(sigmoid_tanh_approx_f32(
+                      float(beta_tile(beta_smem_offset + group_id))))
+                : BF16(0);
+            BF16 beta1 = row1_valid
+                ? BF16(sigmoid_tanh_approx_f32(
+                      float(beta_tile(beta_smem_offset + group_id + 8))))
+                : BF16(0);
 
             // ======== Phase 3: u = (v - u) * beta; u = INV @ u (per block) ========
             SFragT u_bf16[kValueBlocksPerWarp];
@@ -622,8 +631,12 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
                     for (int d = 0; d < 2; ++d) {
                         auto c0 = make_coord(make_coord(a, 0), 0, d);
                         auto c1 = make_coord(make_coord(a, 1), 0, d);
-                        u_bf16[i](c0) = (v_bf16[i](c0) - u_bf16[i](c0)) * beta0;
-                        u_bf16[i](c1) = (v_bf16[i](c1) - u_bf16[i](c1)) * beta1;
+                        u_bf16[i](c0) = row0_valid
+                            ? (v_bf16[i](c0) - u_bf16[i](c0)) * beta0
+                            : BF16(0);
+                        u_bf16[i](c1) = row1_valid
+                            ? (v_bf16[i](c1) - u_bf16[i](c1)) * beta1
+                            : BF16(0);
                     }
                 }
 
@@ -799,7 +812,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
             store_pipeline.consumer_wait(out_read);
             int stage = out_read.index();
             int actual_len = min(CHUNK, seq_len - t * CHUNK);
-
             BF16* out_stage_ptr = shared_storage.output[stage].out.begin();
 
             if (actual_len < CHUNK) {
