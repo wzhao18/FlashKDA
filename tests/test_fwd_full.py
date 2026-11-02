@@ -7,6 +7,11 @@ Compares cutlass kernel vs torch_ref for exact match across:
   - various sequence lengths (up to 1M, fixed-length and varlen)
   - D=128 (fixed)
 
+The exact comparisons pin the serial recurrence (``_segment_chunks=-1``): the
+chunk-parallel recurrence that ``fwd`` picks for long sequences on sm_10x
+rounds differently once it splits a sequence and is covered by
+test_chunk_parallel.py.
+
 Run with: pytest tests/test_fwd_full.py -x -v
 Parallel:  pytest tests/test_fwd_full.py -x -v -n auto  (requires pytest-xdist)
 """
@@ -79,7 +84,8 @@ def test_fwd_fixed(T, H, state_dtype, has_in, has_out):
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k)
+                  initial_state=init_k, final_state=final_k,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     out_ref = torch.zeros_like(q)
@@ -135,7 +141,8 @@ def test_fwd_varlen(seq_lens, H, state_dtype, has_in, has_out):
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k, cu_seqlens=cu_seqlens)
+                  initial_state=init_k, final_state=final_k, cu_seqlens=cu_seqlens,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     out_ref = torch.zeros_like(q)
@@ -189,7 +196,8 @@ def test_fwd_batched(B, T, H, state_dtype, has_in, has_out):
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k)
+                  initial_state=init_k, final_state=final_k,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     # torch ref
@@ -229,7 +237,8 @@ def test_fwd_long(T):
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k)
+                  initial_state=init_k, final_state=final_k,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     out_ref = torch.zeros_like(q)
@@ -262,7 +271,8 @@ def test_fwd_long_varlen(seq_lens):
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=init_k, final_state=final_k, cu_seqlens=cu_seqlens)
+                  initial_state=init_k, final_state=final_k, cu_seqlens=cu_seqlens,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     out_ref = torch.zeros_like(q)

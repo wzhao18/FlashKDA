@@ -5,14 +5,14 @@
 #include "flash_kda.h"
 
 STABLE_TORCH_LIBRARY(flash_kda, m) {
-    m.def("get_workspace_size(int T_total, int H, int N=1) -> int");
+    m.def("get_workspace_size(int T_total, int H, int N=1, int segment_chunks=0) -> int");
     m.def(
         "fwd(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
         "float scale, Tensor(a!) out, Tensor(c!) workspace, Tensor A_log, "
         "Tensor dt_bias, float lower_bound, Tensor? initial_state=None, "
         "Tensor(b!)? final_state=None, Tensor? cu_seqlens=None, "
         "Tensor(d!)? checkpoint_state=None, "
-        "Tensor? checkpoint_offsets=None) -> ()");
+        "Tensor? checkpoint_offsets=None, int segment_chunks=0) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flash_kda, CUDA, m) {

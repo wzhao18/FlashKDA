@@ -4,7 +4,8 @@
 
 #include <torch/csrc/stable/tensor.h>
 
-int64_t get_workspace_size(int64_t T_total, int64_t H, int64_t N = 1);
+int64_t get_workspace_size(
+    int64_t T_total, int64_t H, int64_t N = 1, int64_t segment_chunks = 0);
 
 void fwd(
     const torch::stable::Tensor& q,
@@ -22,4 +23,5 @@ void fwd(
     std::optional<torch::stable::Tensor> final_state = std::nullopt,
     std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt,
     std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
-    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt);
+    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
+    int64_t segment_chunks = 0);

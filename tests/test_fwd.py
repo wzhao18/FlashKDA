@@ -220,7 +220,11 @@ def plot_error_comparison(results, save_path):
 # ============================================================
 
 def test_fwd():
-    """Test: cutlass kernel vs torch ref, require exact match."""
+    """Test: cutlass kernel vs torch ref, require exact match.
+
+    The exact tests pin the serial recurrence (``_segment_chunks=-1``); the
+    chunk-parallel one is covered by test_chunk_parallel.py.
+    """
     B, T, H, D = 1, 8192, 96, 128
     LOWER_BOUND = -5.0
 
@@ -244,7 +248,8 @@ def test_fwd():
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=initial_state.clone(), final_state=final_state_kernel)
+                  initial_state=initial_state.clone(), final_state=final_state_kernel,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     # torch ref
@@ -294,7 +299,8 @@ def test_fwd_varlen():
     out_kernel = torch.zeros_like(q)
     flash_kda.fwd(q, k, v, g, beta, scale, out_kernel,
                   A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                  initial_state=initial_state.clone(), final_state=final_state_kernel, cu_seqlens=cu_seqlens)
+                  initial_state=initial_state.clone(), final_state=final_state_kernel, cu_seqlens=cu_seqlens,
+                  _segment_chunks=-1)
     torch.cuda.synchronize()
 
     # torch ref

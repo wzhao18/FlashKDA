@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <type_traits>
 
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/stable/ops.h>
@@ -10,13 +11,70 @@
 using torch::headeronly::ScalarType;
 using torch::stable::Tensor;
 
+namespace {
+
+constexpr int kChunk = 16;
+constexpr int kHeadDim = 128;
+// K1 workspace bytes per (head, tile); see get_workspace_size.
+constexpr int64_t kPerTileBytes = 3 * kChunk * kHeadDim * 2 + kHeadDim * 4 + 2 * kChunk * kChunk * 2;
+
+struct DeviceInfo {
+    int major = 0;
+    int num_sms = 0;
+};
+
+DeviceInfo query_device(int device) {
+    DeviceInfo info;
+    if (cudaDeviceGetAttribute(&info.major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&info.num_sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return DeviceInfo{};
+    }
+    return info;
+}
+
+// The chunk-parallel recurrence (segment_policy.h) runs on sm_10x, where its
+// cost model was measured; other architectures keep the serial recurrence.
+bool segments_supported(const DeviceInfo& device) {
+    return device.major == 10 && device.num_sms > 0;
+}
+
+// Workspace bytes of the chunk-parallel recurrence for a step of at most
+// total_tiles chunks: none where it can never run.
+int64_t segment_extra_bytes(
+    int64_t total_tiles, int64_t H, int64_t segment_chunks, const DeviceInfo& device) {
+    if (segment_chunks < 0 || !segments_supported(device)) {
+        return 0;
+    }
+    if (segment_chunks == 0 && !segment_split_possible(total_tiles, H, device.num_sms)) {
+        return 0;
+    }
+    return segment_workspace_bytes(total_tiles, H, kHeadDim, segment_chunks);
+}
+
+int64_t state_bytes(const Tensor& t) {
+    return t.numel() * (t.scalar_type() == ScalarType::Float ? 4 : 2);
+}
+
+bool overlaps(const std::optional<Tensor>& a, const std::optional<Tensor>& b) {
+    if (!a.has_value() || !b.has_value()) {
+        return false;
+    }
+    auto const a0 = reinterpret_cast<uintptr_t>(a->const_data_ptr());
+    auto const b0 = reinterpret_cast<uintptr_t>(b->const_data_ptr());
+    return a0 < b0 + uintptr_t(state_bytes(*b)) && b0 < a0 + uintptr_t(state_bytes(*a));
+}
+
+}  // namespace
+
 int64_t get_workspace_size(
     int64_t T_total,
     int64_t H,
-    int64_t N
+    int64_t N,
+    int64_t segment_chunks
 ) {
-    constexpr int CHUNK = 16;
-    constexpr int D = 128;
+    constexpr int CHUNK = kChunk;
+    constexpr int D = kHeadDim;
 
     // Upper bound: each of N sequences adds at most 1 extra tile vs floor division
     int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
@@ -25,9 +83,20 @@ int64_t get_workspace_size(
     static_assert(D * 4 % 128 == 0, "g_total size must be 128-byte aligned");
     static_assert(CHUNK * CHUNK * 2 % 128 == 0, "INV/Mqk size must be 128-byte aligned");
 
-    int64_t per_tile_bytes = 3 * CHUNK * D * 2 + D * 4 + 2 * CHUNK * CHUNK * 2;
+    int64_t per_tile_bytes = kPerTileBytes;
 
-    return H * total_tiles * per_tile_bytes;
+    // The chunk-parallel recurrence keeps its segment transfers after the K1
+    // workspace, sized for the current CUDA device.
+    int device = 0;
+    DeviceInfo device_info;
+    if (cudaGetDevice(&device) == cudaSuccess) {
+        device_info = query_device(device);
+    } else {
+        (void)cudaGetLastError();
+    }
+
+    return H * total_tiles * per_tile_bytes +
+        segment_extra_bytes(total_tiles, H, segment_chunks, device_info);
 }
 
 void fwd(
@@ -46,7 +115,8 @@ void fwd(
     std::optional<Tensor> final_state,
     std::optional<Tensor> cu_seqlens,
     std::optional<Tensor> checkpoint_state,
-    std::optional<Tensor> checkpoint_offsets
+    std::optional<Tensor> checkpoint_offsets,
+    int64_t segment_chunks
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
@@ -258,11 +328,64 @@ void fwd(
         total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
     }
 
+    // Chunk-parallel recurrence (segment_policy.h): long sequences are cut into
+    // segments that run in parallel. It runs where launch_fwd would pick the
+    // V-split K2 tile (2 * H * N <= SMs), so sequences it leaves whole are
+    // bit-identical to launch_fwd, and only when some step of this shape can
+    // split; the segment length itself is picked per step on the device from
+    // cu_seqlens. A workspace without room for the segment transfers (sized
+    // before they existed), states updated in place (initial_state aliasing
+    // final_state or checkpoint_state) and other architectures keep the
+    // serial recurrence. segment_chunks > 0 forces the segment length and
+    // segment_chunks < 0 the serial recurrence; both are for tests only.
+    bool use_segments = false;
+    if (segment_chunks >= 0) {
+        const DeviceInfo device_info{query_device(q.get_device_index()).major, num_sms};
+        const int64_t needed_bytes = H * int64_t(total_tiles) * kPerTileBytes +
+            segment_workspace_bytes(total_tiles, H, D, segment_chunks);
+        const bool eligible = segments_supported(device_info) &&
+            2 * H * N_val <= num_sms &&
+            !overlaps(initial_state, final_state) &&
+            !overlaps(initial_state, checkpoint_state) &&
+            !overlaps(final_state, checkpoint_state) &&
+            workspace.scalar_type() == ScalarType::Byte &&
+            workspace.numel() >= needed_bytes;
+        if (segment_chunks > 0) {
+            STD_TORCH_CHECK(
+                eligible && segment_chunks < kSegmentUnsplit,
+                "segment_chunks > 0 needs the chunk-parallel recurrence: sm_10x, "
+                "2 * H * N <= SM count, states not updated in place, and a uint8 "
+                "workspace of get_workspace_size(..., segment_chunks)");
+            use_segments = true;
+        } else {
+            use_segments = eligible && segment_split_possible(total_tiles, H, num_sms);
+        }
+    }
+
     auto dispatch = [&](auto typed_cu_seqlens) {
         using SeqlenPtr = decltype(typed_cu_seqlens);
+        using SeqlenT = std::remove_cv_t<std::remove_pointer_t<SeqlenPtr>>;
         SeqlenPtr typed_checkpoint_offsets = has_checkpoint
             ? static_cast<SeqlenPtr>(checkpoint_offsets->const_data_ptr())
             : nullptr;
+        if (use_segments) {
+            #define LAUNCH_SEGMENTED(CKPT) \
+                launch_fwd_segmented<128, CKPT, SeqlenT>( \
+                    q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+                    initial_state_raw, scale_f, final_state_raw, state_fp32, \
+                    checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
+                    workspace_ptr, total_tiles, \
+                    int(T_total), int(H), int(N_val), q_stride, k_stride, v_stride, \
+                    typed_cu_seqlens, A_log_ptr, dt_bias_ptr, gate_scale, \
+                    int(segment_chunks), num_sms, stream)
+            if (has_checkpoint) {
+                LAUNCH_SEGMENTED(true);
+            } else {
+                LAUNCH_SEGMENTED(false);
+            }
+            #undef LAUNCH_SEGMENTED
+            return;
+        }
         #define LAUNCH(HI, HO, FP32, CKPT, VL) \
             launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
