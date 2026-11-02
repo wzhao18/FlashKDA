@@ -59,6 +59,7 @@ ext_modules = [
             'csrc/flash_kda.cpp',
             'csrc/torch_api.cpp',
             'csrc/smxx/fwd_launch.cu',
+            'csrc/smxx/fwd_segment_launch.cu',
         ],
         include_dirs=[
             os.path.join(this_dir, 'cutlass', 'include'),
