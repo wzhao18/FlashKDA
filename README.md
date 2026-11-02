@@ -147,7 +147,9 @@ keeps the FP32 state and the BF16 MMA operands, but rounds `M` and `C` to BF16
 separately where K2 rounds their combination, so it is not bitwise equal to K2;
 its error against an FP64 reference matches K2's.
 
-Prepare + recurrence on GB300, 12 heads, FP32 state (CUDA events; the same kernels built out of tree with `-DNDEBUG`):
+Prepare + recurrence on GB300, 12 heads, FP32 state (CUDA events). Measured on
+the out-of-tree build these kernels were ported from (`-DNDEBUG`, int32
+`cu_seqlens`, dense Q/K/V); not yet re-measured with this package's build:
 
 | tokens per sequence | serial (us) | chunk-parallel (us) |
 |---|---|---|
